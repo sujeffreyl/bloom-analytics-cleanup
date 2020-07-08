@@ -35,7 +35,7 @@ export class BookInstanceIdBackfiller {
 
         // Start processing the Parse response, now that we know it succeeded.
         const books = this.getBooksFromResponse(parseResponse).filter((x) => {
-            return !!x.bookInstanceId;
+            return !!x.title && !!x.bookInstanceId;
         });
 
         const parseTuples = books.map((book) => {
@@ -153,11 +153,11 @@ export class BookInstanceIdBackfiller {
 
     private getSqlLookupQuery(schema: string): string {
         return (
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.pages_read WHERE book_instance_id is not null` +
+            `SELECT DISTINCT title, book_instance_id FROM ${schema}.pages_read WHERE title is not null AND book_instance_id is not null` +
             " UNION " +
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.book_or_shelf_opened WHERE book_instance_id is not null` +
+            `SELECT DISTINCT title, book_instance_id FROM ${schema}.book_or_shelf_opened WHERE title is not null AND book_instance_id is not null` +
             " UNION " +
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.comprehension WHERE book_instance_id is not null`
+            `SELECT DISTINCT title, book_instance_id FROM ${schema}.comprehension WHERE title is not null AND book_instance_id is not null`
         );
     }
 
@@ -237,15 +237,16 @@ export class BookInstanceIdBackfiller {
         // Right now, we consider it to be safe if there is only one distinct instance ID a title is associated with.
         const safeUpdates = new Map<string, string>();
         let countAmbiguous = 0;
+        console.log("=====");
+        console.log("=====");
         titleToInstanceIdSet.forEach((instanceIdSet, title) => {
             if (instanceIdSet.size === 1) {
                 const instanceId = instanceIdSet.values().next().value;
                 safeUpdates.set(title, instanceId);
             } else {
                 // A list of non-safe updates to try to deal with manually?
-                console.log("=====");
                 console.log(
-                    `Title with multiple distinct instance ids:: ${title}, NumMatches: ${instanceIdSet.size}`
+                    `Title with multiple distinct instance ids: ${title}, NumMatches: ${instanceIdSet.size}`
                 );
                 ++countAmbiguous;
             }
@@ -300,7 +301,11 @@ export class BookInstanceIdBackfiller {
     }
 
     private async performUpdate(tableName: string, updateQueries: string[]) {
-        console.log("Num update queries = " + updateQueries.length);
+        console.log("=====");
+        console.log("=====");
+        console.log(
+            `${tableName}: Num update queries = ${updateQueries.length}`
+        );
 
         const queryPart1 = `SELECT COUNT(*) AS cnt, COUNT(DISTINCT title) AS count_distinct_problem_titles FROM ${tableName} WHERE book_instance_id IS NULL; `;
 
@@ -310,7 +315,8 @@ export class BookInstanceIdBackfiller {
             ? queryPart2Real
             : queryPart2Fake;
 
-        console.log("queryPart2Real: " + queryPart2Real);
+        console.log("=====");
+        console.log(`${tableName}: update statements: ${queryPart2Real}`);
 
         const queryPart3 = queryPart1;
 
@@ -325,6 +331,8 @@ export class BookInstanceIdBackfiller {
             results[0].rows[0].count_distinct_problem_titles;
         const afterTitleCount =
             results[results.length - 1].rows[0].count_distinct_problem_titles;
+
+        console.log("=====");
         console.log(
             `${tableName}: NumProblemRows Before: ${beforeRowCount}, NumProblemRows After: ${afterRowCount}, NumUpdated=${
                 beforeRowCount - afterRowCount
