@@ -5,6 +5,11 @@ import PostgresConnection from "./connections/PostgresConnection";
 export class BookInstanceIdBackfiller {
     private sqlDb: PostgresConnection;
 
+    // This controls whether or not the update will be performed.
+    // false = Just print out the query
+    // true = Actually execute the query
+    private reallyRunUpdate: boolean = false;
+
     public constructor() {
         this.sqlDb = PostgresConnection.getInstance();
     }
@@ -60,45 +65,47 @@ export class BookInstanceIdBackfiller {
         console.log(`combinedMap.size = ${combinedMap.size}`);
 
         const safeInstanceIdsToUpdate = this.getSafeUpdates(combinedMap);
-        console.log("Original length: " + safeInstanceIdsToUpdate.size);
-
-        // Filter out the ones that aren't relevant to SQL
-        // const filteredSafeInstanceIds = new Map<string, string>();
-        // safeInstanceIdsToUpdate.forEach((instanceId, title) => {
-        //     const instanceIdSet = sqlMap.get(title);
-        //     const doesSqlHaveTitle = !!instanceIdSet;
-        //     if (doesSqlHaveTitle && instanceIdSet && instanceIdSet.size <= 1) {
-        //         const firstExistingValue = instanceIdSet.values().next().value;
-        //         if (firstExistingValue !== instanceId) {
-        //             console.log(`Setting ${title} to ${instanceId}`);
-        //             filteredSafeInstanceIds.set(title, instanceId);
-        //         } else {
-        //             // console.log(
-        //             //     `Skipping ${instanceId} because it already has the correct value.`
-        //             // );
-        //         }
-        //     }
-        // });
-
-        //console.log("New length: " + filteredSafeInstanceIds.size);
 
         // ENHANCE: Think of a better way to make sure we get the right schema of the table
+        await this.updateDatabaseTables(safeInstanceIdsToUpdate);
+    }
+
+    private async updateDatabaseTables(
+        safeInstanceIdsToUpdate: Map<string, string>
+    ) {
+        const schemasToUpdate = this.getSchemaNames();
+        const tablesToUpdate: string[] = [
+            "pages_read",
+            "book_or_shelf_opened",
+            "comprehension",
+            "questions_correct",
+        ];
+        for (const schemaName of schemasToUpdate) {
+            for (const table of tablesToUpdate) {
+                await this.updateDatabaseTable(
+                    `${schemaName}.${table}`,
+                    safeInstanceIdsToUpdate
+                );
+            }
+        }
+    }
+
+    private async updateDatabaseTable(
+        table: string,
+        safeInstanceIdsToUpdate: Map<string, string>
+    ) {
         const updateQueries = await this.generateUpdateSqlQuery(
             safeInstanceIdsToUpdate,
-            "bloomreadertest.pages_read"
+            table
         );
 
         if (updateQueries && updateQueries.length) {
-            console.log(
-                "Update queries (top 10): " +
-                    JSON.stringify(updateQueries.slice(0, 10))
-            );
+            // console.log(
+            //     "Update queries (top 10): " +
+            //         JSON.stringify(updateQueries.slice(0, 10))
+            // );
 
-            await this.performUpdate(
-                "bloomreadertest.pages_read",
-                updateQueries
-            );
-            // TODO: Perform the DB update, when you're sure you got it right.
+            await this.performUpdate(table, updateQueries);
         }
     }
 
@@ -115,9 +122,6 @@ export class BookInstanceIdBackfiller {
         };
 
         const url = `${connection.url}/classes/books`;
-        // console.log(
-        //     "axiosRequestConfig: " + JSON.stringify(axiosRequestConfig)
-        // );
         const parseCall = axios.get(url, axiosRequestConfig).catch((error) => {
             throw new Error("Parse Request failed: " + error.message);
         });
@@ -125,15 +129,21 @@ export class BookInstanceIdBackfiller {
         return parseCall;
     }
 
+    private getSchemaNames(): string[] {
+        return ["bloomreadertest"]; // dev
+        //return ["bloomreader", "bloomreaderbeta"]; // the real thing
+    }
+
     // Returns a promise to execute the relevant SQL query
     private getSqlCall(): Promise<any[]> {
         // ENHANCE: is there union distinct vs. union all?
-        const schema = "bloomreader";
-        //const schema = "bloomreadertest";
-        const query =
-            this.getSqlLookupQuery("bloomreader") +
-            " UNION " +
-            this.getSqlLookupQuery("bloomreaderbeta");
+        const schemas = this.getSchemaNames();
+
+        const queryComponents = schemas.map((schema) => {
+            return this.getSqlLookupQuery(schema);
+        });
+        const query = queryComponents.join(" UNION ");
+
         const sqlCall = this.sqlDb.executeQuery(query).catch((error) => {
             throw new Error("Postgresql Request failed: " + error.message);
         });
@@ -224,24 +234,24 @@ export class BookInstanceIdBackfiller {
     private getSafeUpdates(
         titleToInstanceIdSet: Map<string, Set<string>>
     ): Map<string, string> {
-        // RIght now, we consider it to be safe if there is only one instance ID a title is associated with.
+        // Right now, we consider it to be safe if there is only one distinct instance ID a title is associated with.
         const safeUpdates = new Map<string, string>();
+        let countAmbiguous = 0;
         titleToInstanceIdSet.forEach((instanceIdSet, title) => {
             if (instanceIdSet.size === 1) {
                 const instanceId = instanceIdSet.values().next().value;
                 safeUpdates.set(title, instanceId);
             } else {
-                // ENHANCE: Maybe we'd like to print out a list of non-safe updates to try to deal with manually?
-                console.log();
+                // A list of non-safe updates to try to deal with manually?
                 console.log("=====");
-                console.log("Titles with multiple instance ids:");
                 console.log(
-                    `Title: ${title}, NumMatches: ${instanceIdSet.size}, Values=???`
+                    `Title with multiple distinct instance ids:: ${title}, NumMatches: ${instanceIdSet.size}`
                 );
-                console.log("=====");
-                console.log();
+                ++countAmbiguous;
             }
         });
+
+        console.log("AmbiguousCount = " + countAmbiguous);
         return safeUpdates;
     }
 
@@ -259,20 +269,20 @@ export class BookInstanceIdBackfiller {
 
         const queries: string[] = [];
         titleToInstanceIds.forEach((instanceId, title) => {
-            // Crude check against SQL injection
-            if (title && title.indexOf(";") >= 0) {
-                console.error(
-                    `Did not update title ${title} because it contains a semi-colon`
-                );
-                return;
-            }
+            // // Crude check against SQL injection
+            // if (title && title.indexOf(";") >= 0) {
+            //     console.error(
+            //         `Did not update title ${title} because it contains a semi-colon`
+            //     );
+            //     return;
+            // }
 
+            const sanitizedTitle = title.replace(/'/g, "''");
             if (titlesWhichNeedUpdate.includes(title)) {
-                const query = `UPDATE ${tableName} SET book_instance_id = '${instanceId}' WHERE title = '${title}' AND book_instance_id is null;`;
+                const query = `UPDATE ${tableName} SET book_instance_id = '${instanceId}' WHERE title = '${sanitizedTitle}' AND book_instance_id is null;`;
                 queries.push(query);
             }
         });
-        console.log("queries.length = " + queries.length);
         return queries;
     }
 
@@ -290,10 +300,17 @@ export class BookInstanceIdBackfiller {
     }
 
     private async performUpdate(tableName: string, updateQueries: string[]) {
-        const queryPart1 = `SELECT COUNT(DISTINCT title) AS count_distinct_problem_titles FROM ${tableName} WHERE book_instance_id IS NULL; `;
+        console.log("Num update queries = " + updateQueries.length);
 
-        // TODO: updateQueries would go in here
-        const queryPart2 = queryPart1;
+        const queryPart1 = `SELECT COUNT(*) AS cnt, COUNT(DISTINCT title) AS count_distinct_problem_titles FROM ${tableName} WHERE book_instance_id IS NULL; `;
+
+        const queryPart2Real = updateQueries.join(" ");
+        const queryPart2Fake = `SELECT * FROM ${tableName} limit 1; SELECT * FROM ${tableName} limit 1;`;
+        const queryPart2 = this.reallyRunUpdate
+            ? queryPart2Real
+            : queryPart2Fake;
+
+        console.log("queryPart2Real: " + queryPart2Real);
 
         const queryPart3 = queryPart1;
 
@@ -302,21 +319,21 @@ export class BookInstanceIdBackfiller {
         const results = await this.sqlDb.executeMultiStatementQuery(
             combinedQuery
         );
-        const beforeCount = results[0].rows[0].count_distinct_problem_titles;
-        const afterCount = results[2].rows[0].count_distinct_problem_titles;
-        console.log(`Before: ${beforeCount}, After: ${afterCount}`);
+        const beforeRowCount = results[0].rows[0].cnt;
+        const afterRowCount = results[results.length - 1].rows[0].cnt;
+        const beforeTitleCount =
+            results[0].rows[0].count_distinct_problem_titles;
+        const afterTitleCount =
+            results[results.length - 1].rows[0].count_distinct_problem_titles;
+        console.log(
+            `${tableName}: NumProblemRows Before: ${beforeRowCount}, NumProblemRows After: ${afterRowCount}, NumUpdated=${
+                beforeRowCount - afterRowCount
+            }`
+        );
+        console.log(
+            `${tableName}: NumDistinctProblemTitles Before: ${beforeTitleCount}, NumDistinctProblemTitles After: ${afterTitleCount}, NumUpdated=${
+                beforeTitleCount - afterTitleCount
+            }`
+        );
     }
 }
-
-interface Asdf {
-    bookInstanceId: string;
-    source: string;
-    IParseBook;
-    sqlObject: any;
-}
-
-// TODO: Update pages_read, book_or_shelf_opened, questions_correct (need to add column too), comprehension
-
-// SELECT DISTINCT title, bookInstanceId FROM bloomreadertest.pages_read WHERE bookInstanceId is not null
-
-// SELECT id, title FROM bloomreadertest.pages_read WHERE bookInstanceId is null
