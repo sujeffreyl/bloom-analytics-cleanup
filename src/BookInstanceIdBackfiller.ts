@@ -64,49 +64,18 @@ export class BookInstanceIdBackfiller {
         console.log(`sqlMap.size = ${sqlMap.size}`);
         console.log(`combinedMap.size = ${combinedMap.size}`);
 
-        const safeInstanceIdsToUpdate = this.getSafeUpdates(combinedMap);
+        const [
+            safeInstanceIdsToUpdate,
+            ambiguousTitles,
+        ] = this.getSafeVsAmbiguousUpdates(combinedMap);
 
         // ENHANCE: Think of a better way to make sure we get the right schema of the table
         await this.updateDatabaseTables(safeInstanceIdsToUpdate);
-    }
 
-    private async updateDatabaseTables(
-        safeInstanceIdsToUpdate: Map<string, string>
-    ) {
-        const schemasToUpdate = this.getSchemaNames();
-        const tablesToUpdate: string[] = [
-            "pages_read",
-            "book_or_shelf_opened",
-            "comprehension",
-            "questions_correct",
-        ];
-        for (const schemaName of schemasToUpdate) {
-            for (const table of tablesToUpdate) {
-                await this.updateDatabaseTable(
-                    `${schemaName}.${table}`,
-                    safeInstanceIdsToUpdate
-                );
-            }
-        }
-    }
-
-    private async updateDatabaseTable(
-        table: string,
-        safeInstanceIdsToUpdate: Map<string, string>
-    ) {
-        const updateQueries = await this.generateUpdateSqlQuery(
+        await this.updateInstanceIdsForNullOnly(
             safeInstanceIdsToUpdate,
-            table
+            ambiguousTitles
         );
-
-        if (updateQueries && updateQueries.length) {
-            // console.log(
-            //     "Update queries (top 10): " +
-            //         JSON.stringify(updateQueries.slice(0, 10))
-            // );
-
-            await this.performUpdate(table, updateQueries);
-        }
     }
 
     // Returns a promise which gets the Parse results for each book in Bloom LIbrary with its title and instanceId
@@ -132,6 +101,15 @@ export class BookInstanceIdBackfiller {
     private getSchemaNames(): string[] {
         return ["bloomreadertest"]; // dev
         //return ["bloomreader", "bloomreaderbeta"]; // the real thing
+    }
+
+    private getTablesToUpdate(): string[] {
+        return [
+            "pages_read",
+            "book_or_shelf_opened",
+            "comprehension",
+            "questions_correct",
+        ];
     }
 
     // Returns a promise to execute the relevant SQL query
@@ -165,23 +143,6 @@ export class BookInstanceIdBackfiller {
         // Just assuming that the data is in the expected format, which is where each result is an IBook
         return response.data.results as IBook[];
     }
-
-    // // If more than one book has the same title, the map will store all of them in the array of books.
-    // private getBooksByTitle(books: IBook[]): Map<string, IBook[]> {
-    //     const map = new Map<string, IBook[]>();
-    //     for (let i = 0; i < books.length; ++i) {
-    //         const book = books[i];
-
-    //         const matchingBooks: IBook[] | undefined = map.get(book.title);
-    //         if (!matchingBooks) {
-    //             map.set(book.title, [book]);
-    //         } else {
-    //             matchingBooks.push(book);
-    //         }
-    //     }
-
-    //     return map;
-    // }
 
     private getBookInstanceIdsByTitle(
         tuples: { title: string; bookInstanceId: string }[]
@@ -231,12 +192,12 @@ export class BookInstanceIdBackfiller {
     //     });
     // }
 
-    private getSafeUpdates(
+    private getSafeVsAmbiguousUpdates(
         titleToInstanceIdSet: Map<string, Set<string>>
-    ): Map<string, string> {
+    ): [Map<string, string>, string[]] {
         // Right now, we consider it to be safe if there is only one distinct instance ID a title is associated with.
         const safeUpdates = new Map<string, string>();
-        let countAmbiguous = 0;
+        const ambiguousTitles: string[] = [];
         console.log("=====");
         console.log("=====");
         titleToInstanceIdSet.forEach((instanceIdSet, title) => {
@@ -248,12 +209,47 @@ export class BookInstanceIdBackfiller {
                 console.log(
                     `Title with multiple distinct instance ids: ${title}, NumMatches: ${instanceIdSet.size}`
                 );
-                ++countAmbiguous;
+
+                ambiguousTitles.push(title);
             }
         });
 
-        console.log("AmbiguousCount = " + countAmbiguous);
-        return safeUpdates;
+        console.log("AmbiguousCount = " + ambiguousTitles.length);
+        return [safeUpdates, ambiguousTitles];
+    }
+
+    private async updateDatabaseTables(
+        safeInstanceIdsToUpdate: Map<string, string>
+    ) {
+        const schemasToUpdate = this.getSchemaNames();
+        const tablesToUpdate = this.getTablesToUpdate();
+        for (const schemaName of schemasToUpdate) {
+            for (const table of tablesToUpdate) {
+                await this.updateDatabaseTable(
+                    `${schemaName}.${table}`,
+                    safeInstanceIdsToUpdate
+                );
+            }
+        }
+    }
+
+    private async updateDatabaseTable(
+        table: string,
+        safeInstanceIdsToUpdate: Map<string, string>
+    ) {
+        const updateQueries = await this.generateUpdateSqlQuery(
+            safeInstanceIdsToUpdate,
+            table
+        );
+
+        if (updateQueries && updateQueries.length) {
+            // console.log(
+            //     "Update queries (top 10): " +
+            //         JSON.stringify(updateQueries.slice(0, 10))
+            // );
+
+            await this.performUpdate(table, updateQueries);
+        }
     }
 
     private async generateUpdateSqlQuery(
@@ -343,5 +339,111 @@ export class BookInstanceIdBackfiller {
                 beforeTitleCount - afterTitleCount
             }`
         );
+    }
+
+    private async updateInstanceIdsForNullOnly(
+        safeInstanceIdsToUpdate: Map<string, string>,
+        ambiguousTitles: string[]
+    ) {
+        console.log(
+            "===\nGenerating fake book-instance-ids for titles with no non-null bookInstanceIds associated with them\n==="
+        );
+        const nullOnlyTitles = await this.getTitlesWithOnlyNullInstanceIds(
+            safeInstanceIdsToUpdate,
+            ambiguousTitles
+        );
+
+        console.log(
+            "Number of titles with no non-null bookInstanceIds: " +
+                nullOnlyTitles.length
+        );
+
+        const titlesToNewIds = new Map<string, string>();
+        nullOnlyTitles.forEach((title) => {
+            const id = this.getFakeId();
+            titlesToNewIds.set(title, id);
+        });
+
+        await this.updateDatabaseTables(titlesToNewIds);
+    }
+
+    // Retrieves the set of titles without instance IDs from the SQL database,
+    // then removes the titles with 1 or more instance IDs associated with them
+    // in either other records in the SQL database OR th PARSE database.
+    // These are therefore titles for which we need an instanceID but have no way
+    // to obtain a correct one.
+    // (It really just wants a set of titles are associated with some instanceId,
+    // but the one caller has these two separate data structures so we made it accept them.)
+    private async getTitlesWithOnlyNullInstanceIds(
+        titlesWithKnownInstanceIds: Map<string, string>, // That is, exactly 1 non-null isntance id is associated with this title.
+        titlesWithAmbiguousInstanceIds: string[] // That is, 2+ non-null instance ids are associated with this title
+    ): Promise<string[]> {
+        // Massage the input parameters into the ideal format
+        const titlesWithNonNullInstanceIds = new Set<string>(
+            titlesWithKnownInstanceIds.keys()
+        );
+
+        titlesWithAmbiguousInstanceIds.forEach((title) => {
+            titlesWithNonNullInstanceIds.add(title);
+        });
+
+        return this.getTitlesWithOnlyNullInstanceIdsInternal(
+            titlesWithNonNullInstanceIds
+        );
+    }
+
+    // Retrieves the set of titles without instance IDs from the SQL database,
+    // then removes the titles with 1 or more instance IDs associated with them
+    // in either other records in the SQL database OR th PARSE database.
+    private async getTitlesWithOnlyNullInstanceIdsInternal(
+        titlesWithNonNullInstanceIds: Set<string>
+    ): Promise<string[]> {
+        const schemasToUpdate = this.getSchemaNames();
+        const tablesToUpdate = this.getTablesToUpdate();
+
+        const queryComponents: string[] = [];
+        for (const schemaName of schemasToUpdate) {
+            for (const table of tablesToUpdate) {
+                // Gets all titles from SQL
+                const sqlQuery = `SELECT DISTINCT title FROM ${schemaName}.${table} WHERE title IS NOT NULL`;
+                queryComponents.push(sqlQuery);
+            }
+        }
+
+        const combinedQuery = queryComponents.join(" UNION "); // FYI, Union performs dedpulication
+
+        const results = await this.sqlDb.executeQuery(combinedQuery);
+
+        // Now filter out titles that we know have one or more non-null bookInstanceIds across both Parse and SQL
+        // Note: Even though you could write a SQL query to get titles which don't have any non-null book_instance_ids IN THE SQL DATABASE,
+        //       what we actually need is those that are lacking them in both.
+        const titleCandidates = results.map((result) => result.title);
+        const nullOnlyTitles = titleCandidates.filter((title) => {
+            return !titlesWithNonNullInstanceIds.has(title);
+        });
+
+        return nullOnlyTitles;
+    }
+
+    // Generates a fake book-instance-id for books where we cannot find any existing book-instance-id.
+    private getFakeId(): string {
+        return `auto_${this.createUuid()}`;
+    }
+
+    // from http://stackoverflow.com/questions/105034/create-guid-uuid-in-javascript
+    private createUuid(): string {
+        // http://www.ietf.org/rfc/rfc4122.txt
+        const s: string[] = [];
+        const hexDigits = "0123456789abcdef";
+        for (let i = 0; i < 36; i++) {
+            s[i] = hexDigits.substr(Math.floor(Math.random() * 0x10), 1);
+        }
+        s[14] = "4"; // bits 12-15 of the time_hi_and_version field to 0010
+        // tslint:disable-next-line: no-bitwise
+        s[19] = hexDigits.substr((s[19].charCodeAt(0) & 0x3) | 0x8, 1); // bits 6-7 of the clock_seq_hi_and_reserved to 01
+        s[8] = s[13] = s[18] = s[23] = "-";
+
+        const uuid = s.join("");
+        return uuid;
     }
 }
