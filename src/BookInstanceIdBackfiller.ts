@@ -1,6 +1,8 @@
 import axios, { AxiosRequestConfig, AxiosResponse } from "axios";
 import { getConnection as getParseConnection } from "./connections/ParseServerConnection";
 import PostgresConnection from "./connections/PostgresConnection";
+import { environment } from "./main";
+import { Environment } from "./Environment";
 
 export class BookInstanceIdBackfiller {
     private sqlDb: PostgresConnection;
@@ -99,8 +101,15 @@ export class BookInstanceIdBackfiller {
     }
 
     private getSchemaNames(): string[] {
-        return ["bloomreadertest"]; // dev
-        //return ["bloomreader", "bloomreaderbeta"]; // the real thing
+        switch (environment) {
+            case Environment.Dev:
+            case Environment.Local:
+                return ["bloomreadertest"];
+            case Environment.Prod:
+                return ["bloomreader", "bloomreaderbeta"]; // the real thing
+            default:
+                throw new Error("Invalid environment set");
+        }
     }
 
     private getTablesToUpdate(): string[] {

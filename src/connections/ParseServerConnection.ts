@@ -1,11 +1,9 @@
-import axios from "axios";
-//import { LoggedInUser, User } from "./LoggedInUser";
+import { environment } from "../main";
+import { Environment } from "../Environment";
 
 // This file exports a function getConnection(), which returns the headers
 // needed to talk to our Parse Server backend db.
-// It keeps track of whether we're working with dev/staging or production or
-// (via a one-line code change) a local database, and also stores and returns
-// the token we get from parse-server when authorized as a particular user.
+// The environment is based on the setting in main.ts.
 interface IConnection {
     headers: {
         "Content-Type": string;
@@ -39,7 +37,14 @@ const local: IConnection = {
 };
 
 export function getConnection(): IConnection {
-    //return local;
-    //return dev;
-    return prod;
+    switch (environment) {
+        case Environment.Dev:
+            return dev;
+        case Environment.Prod:
+            return prod;
+        case Environment.Local:
+            return local;
+        default:
+            throw new Error("Invalid environment set");
+    }
 }
