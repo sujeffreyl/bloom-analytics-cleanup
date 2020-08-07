@@ -3,6 +3,7 @@ import { getConnection as getParseConnection } from "./connections/ParseServerCo
 import PostgresConnection from "./connections/PostgresConnection";
 import { environment } from "./main";
 import { Environment } from "./Environment";
+import { performance } from "perf_hooks";
 
 export class BookInstanceIdBackfiller {
     private sqlDb: PostgresConnection;
@@ -19,10 +20,12 @@ export class BookInstanceIdBackfiller {
     public async backfill(): Promise<void> {
         console.log("Starting backfill function.");
 
+        const startTime = performance.now();
         const [parseResponse, sqlResults] = await Promise.all([
             this.getParseCall(),
             this.getSqlCall(),
         ]);
+        this.printTimeTakenSince(startTime, "Time to get Parse/SQL results");
 
         if (
             parseResponse.status !== 200 ||
@@ -71,13 +74,33 @@ export class BookInstanceIdBackfiller {
             ambiguousTitles,
         ] = this.getSafeVsAmbiguousUpdates(combinedMap);
 
-        // ENHANCE: Think of a better way to make sure we get the right schema of the table
-        await this.updateDatabaseTables(safeInstanceIdsToUpdate);
+        console.log(
+            `safeInstanceIdsToUpdate.size = ${safeInstanceIdsToUpdate.size}`
+        );
 
+        const updateDatabaseTableStartTime = performance.now();
+        await this.updateDatabaseTables(safeInstanceIdsToUpdate);
+        this.printTimeTakenSince(
+            updateDatabaseTableStartTime,
+            "updateDatabaseTable() Time"
+        );
+
+        const updateInstanceIdsForNullOnlyStartTime = performance.now();
         await this.updateInstanceIdsForNullOnly(
             safeInstanceIdsToUpdate,
             ambiguousTitles
         );
+        this.printTimeTakenSince(
+            updateInstanceIdsForNullOnlyStartTime,
+            "updateInstanceIdsForNullOnly() Time"
+        );
+
+        this.printTimeTakenSince(startTime, "Total Time");
+    }
+
+    private printTimeTakenSince(startTime: number, message: string): void {
+        const timeTaken = (performance.now() - startTime) / 1000;
+        console.log(`${message}: ${timeTaken.toFixed(1)} seconds`);
     }
 
     // Returns a promise which gets the Parse results for each book in Bloom LIbrary with its title and instanceId
@@ -121,16 +144,45 @@ export class BookInstanceIdBackfiller {
         ];
     }
 
+    private getSchemaTablesToUpdate(): string[] {
+        const arr: string[] = [];
+        const schemasToUpdate = this.getSchemaNames();
+        const tablesToUpdate = this.getTablesToUpdate();
+        for (const schemaName of schemasToUpdate) {
+            for (const table of tablesToUpdate) {
+                arr.push(`${schemaName}.${table}`);
+            }
+        }
+
+        switch (environment) {
+            case Environment.Dev:
+            case Environment.Local:
+                arr.push("bloomlibrary_test.download_book");
+                break;
+            case Environment.Prod:
+                arr.push("bloomlibrary_org.download_book");
+                break;
+            default:
+                throw new Error("Invalid environment set");
+        }
+
+        return arr;
+    }
+
+    private getTitleFieldForTable(tableName: string): string {
+        if (
+            tableName === "download_book" ||
+            tableName.endsWith(".download_book")
+        ) {
+            return "book_title";
+        } else {
+            return "title";
+        }
+    }
+
     // Returns a promise to execute the relevant SQL query
     private getSqlCall(): Promise<any[]> {
-        // ENHANCE: is there union distinct vs. union all?
-        const schemas = this.getSchemaNames();
-
-        const queryComponents = schemas.map((schema) => {
-            return this.getSqlLookupQuery(schema);
-        });
-        const query = queryComponents.join(" UNION ");
-
+        const query = this.getSqlLookupQuery();
         const sqlCall = this.sqlDb.executeQuery(query).catch((error) => {
             throw new Error("Postgresql Request failed: " + error.message);
         });
@@ -138,14 +190,15 @@ export class BookInstanceIdBackfiller {
         return sqlCall;
     }
 
-    private getSqlLookupQuery(schema: string): string {
-        return (
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.pages_read WHERE title is not null AND book_instance_id is not null` +
-            " UNION " +
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.book_or_shelf_opened WHERE title is not null AND book_instance_id is not null` +
-            " UNION " +
-            `SELECT DISTINCT title, book_instance_id FROM ${schema}.comprehension WHERE title is not null AND book_instance_id is not null`
-        );
+    private getSqlLookupQuery(): string {
+        const schemaTables = this.getSchemaTablesToUpdate();
+        const subQueries = schemaTables.map((schemaTable) => {
+            const titleFieldName = this.getTitleFieldForTable(schemaTable);
+            return `SELECT ${titleFieldName} AS title, book_instance_id FROM ${schemaTable} WHERE ${titleFieldName} is not null AND book_instance_id is not null`;
+        });
+
+        const combinedQuery = subQueries.join(" UNION "); // UNION implies DISTINCT
+        return combinedQuery;
     }
 
     private getBooksFromResponse(response: AxiosResponse<any>): IBook[] {
@@ -205,6 +258,8 @@ export class BookInstanceIdBackfiller {
         titleToInstanceIdSet: Map<string, Set<string>>
     ): [Map<string, string>, string[]] {
         // Right now, we consider it to be safe if there is only one distinct instance ID a title is associated with.
+        //
+        // TODO: We should also consider a safe update to be if there is only one distinct non-auto-generated instanceId.
         const safeUpdates = new Map<string, string>();
         const ambiguousTitles: string[] = [];
         console.log("=====");
@@ -230,16 +285,27 @@ export class BookInstanceIdBackfiller {
     private async updateDatabaseTables(
         safeInstanceIdsToUpdate: Map<string, string>
     ) {
-        const schemasToUpdate = this.getSchemaNames();
-        const tablesToUpdate = this.getTablesToUpdate();
-        for (const schemaName of schemasToUpdate) {
-            for (const table of tablesToUpdate) {
-                await this.updateDatabaseTable(
-                    `${schemaName}.${table}`,
-                    safeInstanceIdsToUpdate
-                );
-            }
+        const schemaTablesToUpdate = this.getSchemaTablesToUpdate();
+
+        for (const schemaTable of schemaTablesToUpdate) {
+            await this.updateDatabaseTable(
+                schemaTable,
+                safeInstanceIdsToUpdate
+            );
         }
+
+        // Not sure if this is any faster?
+        // Will the DB be upset if it has to work on multiple queries at once?
+        // One downside of this approach is it will make the logs more confusing to read.
+        //
+        // const updateTasks = schemaTablesToUpdate.map((schemaTable) => {
+        //     return this.updateDatabaseTable(
+        //         schemaTable,
+        //         safeInstanceIdsToUpdate
+        //     );
+        // });
+
+        // return Promise.all(updateTasks);
     }
 
     private async updateDatabaseTable(
@@ -252,12 +318,9 @@ export class BookInstanceIdBackfiller {
         );
 
         if (updateQueries && updateQueries.length) {
-            // console.log(
-            //     "Update queries (top 10): " +
-            //         JSON.stringify(updateQueries.slice(0, 10))
-            // );
-
             await this.performUpdate(table, updateQueries);
+        } else {
+            console.log("No updates for " + table);
         }
     }
 
@@ -268,6 +331,8 @@ export class BookInstanceIdBackfiller {
         if (titleToInstanceIds.size <= 0) {
             return [];
         }
+
+        const titleField = this.getTitleFieldForTable(tableName);
 
         const titlesWhichNeedUpdate: string[] = await this.getTitlesWhichNeedUpdate(
             tableName
@@ -285,7 +350,7 @@ export class BookInstanceIdBackfiller {
 
             const sanitizedTitle = title.replace(/'/g, "''");
             if (titlesWhichNeedUpdate.includes(title)) {
-                const query = `UPDATE ${tableName} SET book_instance_id = '${instanceId}' WHERE title = '${sanitizedTitle}' AND book_instance_id is null;`;
+                const query = `UPDATE ${tableName} SET book_instance_id = '${instanceId}' WHERE ${titleField} = '${sanitizedTitle}' AND book_instance_id is null;`;
                 queries.push(query);
             }
         });
@@ -295,7 +360,9 @@ export class BookInstanceIdBackfiller {
     private async getTitlesWhichNeedUpdate(
         tableName: string
     ): Promise<string[]> {
-        const query = `SELECT DISTINCT title FROM ${tableName} WHERE book_instance_id IS NULL`;
+        const titleField = this.getTitleFieldForTable(tableName);
+
+        const query = `SELECT DISTINCT ${titleField} AS title FROM ${tableName} WHERE book_instance_id IS NULL`;
         const sqlResults = await this.sqlDb
             .executeQuery(query)
             .catch((error) => {
@@ -312,7 +379,8 @@ export class BookInstanceIdBackfiller {
             `${tableName}: Num update queries = ${updateQueries.length}`
         );
 
-        const queryPart1 = `SELECT COUNT(*) AS cnt, COUNT(DISTINCT title) AS count_distinct_problem_titles FROM ${tableName} WHERE book_instance_id IS NULL; `;
+        const titleField = this.getTitleFieldForTable(tableName);
+        const queryPart1 = `SELECT COUNT(*) AS cnt, COUNT(DISTINCT ${titleField}) AS count_distinct_problem_titles FROM ${tableName} WHERE book_instance_id IS NULL; `;
 
         const queryPart2Real = updateQueries.join(" ");
         const queryPart2Fake = `SELECT * FROM ${tableName} limit 1; SELECT * FROM ${tableName} limit 1;`;
@@ -407,19 +475,17 @@ export class BookInstanceIdBackfiller {
     private async getTitlesWithOnlyNullInstanceIdsInternal(
         titlesWithNonNullInstanceIds: Set<string>
     ): Promise<string[]> {
-        const schemasToUpdate = this.getSchemaNames();
-        const tablesToUpdate = this.getTablesToUpdate();
-
         const queryComponents: string[] = [];
-        for (const schemaName of schemasToUpdate) {
-            for (const table of tablesToUpdate) {
-                // Gets all titles from SQL
-                const sqlQuery = `SELECT DISTINCT title FROM ${schemaName}.${table} WHERE title IS NOT NULL`;
-                queryComponents.push(sqlQuery);
-            }
+
+        const schemaTablesToUpdate = this.getSchemaTablesToUpdate();
+        for (const schemaTable of schemaTablesToUpdate) {
+            // Gets all titles from SQL
+            const titleField = this.getTitleFieldForTable(schemaTable);
+            const sqlQuery = `SELECT ${titleField} AS title FROM ${schemaTable} WHERE ${titleField} IS NOT NULL`;
+            queryComponents.push(sqlQuery);
         }
 
-        const combinedQuery = queryComponents.join(" UNION "); // FYI, Union performs dedpulication
+        const combinedQuery = queryComponents.join(" UNION "); // FYI, Union performs deduplication
 
         const results = await this.sqlDb.executeQuery(combinedQuery);
 
